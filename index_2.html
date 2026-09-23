@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>確率分布アキネーター</title>
+<style>
+  body { margin: 0; font-family: system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif; color: #222; background: #fff; }
+  main { max-width: 1000px; margin: 0 auto; padding: 20px 16px; display: flex; gap: 32px; flex-wrap: wrap; }
+  #left { width: 220px; }
+  #right { flex: 1; min-width: 300px; }
+  #distName { margin: 0; font-size: 16px; }
+  #distFormula { margin: 2px 0 16px; font-size: 13px; color: #777; }
+  .param { margin-bottom: 8px; }
+  .param label { display: inline-block; width: 28px; font-style: italic; }
+  .param input { width: 100px; font-size: 15px; padding: 3px 4px; }
+  .param small { color: #999; font-size: 12px; margin-left: 4px; }
+  button { font-size: 14px; padding: 4px 12px; margin: 8px 6px 0 0; }
+  #result { margin-top: 16px; font-size: 14px; line-height: 1.6; }
+  #mark { font-size: 32px; }
+  #streak { margin-top: 12px; font-size: 13px; color: #777; }
+  .canvasWrap { position: relative; width: 100%; aspect-ratio: 4 / 3; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<main>
+  <div id="left">
+    <p id="distName"></p>
+    <p id="distFormula"></p>
+    <form id="form">
+      <div id="params"></div>
+      <button type="submit" id="submitBtn">回答する</button><button type="button" id="skip">スキップ</button>
+    </form>
+    <div id="result"><div id="mark"></div><div id="detail"></div></div>
+    <div id="streak">連続正解：0</div>
+  </div>
+  <div id="right">
+    <div class="canvasWrap"><canvas id="plot"></canvas></div>
+  </div>
+</main>
+
+<script>
+// ===== 設定 =====
+const THRESHOLD = 0.30; // 誤差スコアがこれ以下なら正解（各パラメータの範囲幅に対する誤差の平均）
+
+// ===== 数学ユーティリティ =====
+function lnGamma(z) { // Lanczos近似
+  const g = 7, c = [0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+  if (z < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * z)) - lnGamma(1 - z);
+  z -= 1;
+  let x = c[0];
+  for (let i = 1; i < g + 2; i++) x += c[i] / (z + i);
+  const t = z + g + 0.5;
+  return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
+}
+const lnBeta = (a, b) => lnGamma(a) + lnGamma(b) - lnGamma(a + b);
+
+// ===== 分布の定義 =====
+// params: key(内部名), label(表示), min/max(出題範囲), step(刻み)
+const DISTS = [
+  {
+    name: "正規分布", formula: "N(μ, σ)",
+    params: [
+      { key: "mu", label: "μ", min: -5, max: 5, step: 0.5 },
+      { key: "sigma", label: "σ", min: 0.5, max: 3, step: 0.1 },
+    ],
+    pdf: (x, p) => Math.exp(-((x - p.mu) ** 2) / (2 * p.sigma ** 2)) / (p.sigma * Math.sqrt(2 * Math.PI)),
+    range: p => [p.mu - 4 * p.sigma, p.mu + 4 * p.sigma],
+  },
+  {
+    name: "指数分布", formula: "Exp(λ)　（平均 1/λ）",
+    params: [{ key: "lambda", label: "λ", min: 0.2, max: 3, step: 0.1 }],
+    pdf: (x, p) => (x < 0 ? 0 : p.lambda * Math.exp(-p.lambda * x)),
+    range: p => [0, 5 / p.lambda],
+  },
+  {
+    name: "ガンマ分布", formula: "Gamma(k, θ)　（形状 k, 尺度 θ）",
+    params: [
+      { key: "k", label: "k", min: 1, max: 10, step: 0.5 },
+      { key: "theta", label: "θ", min: 0.5, max: 3, step: 0.1 },
+    ],
+    pdf: (x, p) => x <= 0 ? 0 :
+      Math.exp((p.k - 1) * Math.log(x) - x / p.theta - lnGamma(p.k) - p.k * Math.log(p.theta)),
+    range: p => [0, p.k * p.theta + 5 * Math.sqrt(p.k) * p.theta],
+  },
+  {
+    name: "ベータ分布", formula: "Beta(α, β)",
+    params: [
+      { key: "a", label: "α", min: 1, max: 8, step: 0.5 },
+      { key: "b", label: "β", min: 1, max: 8, step: 0.5 },
+    ],
+    pdf: (x, p) => (x <= 0 || x >= 1) ? 0 :
+      Math.exp((p.a - 1) * Math.log(x) + (p.b - 1) * Math.log(1 - x) - lnBeta(p.a, p.b)),
+    range: () => [0, 1],
+  },
+  {
+    name: "対数正規分布", formula: "LogNormal(μ, σ)　（log X ~ N(μ, σ)）",
+    params: [
+      { key: "mu", label: "μ", min: -1, max: 1, step: 0.1 },
+      { key: "sigma", label: "σ", min: 0.2, max: 1, step: 0.1 },
+    ],
+    pdf: (x, p) => x <= 0 ? 0 :
+      Math.exp(-((Math.log(x) - p.mu) ** 2) / (2 * p.sigma ** 2)) / (x * p.sigma * Math.sqrt(2 * Math.PI)),
+    range: p => [0, Math.exp(p.mu + 3 * p.sigma)],
+  },
+  {
+    name: "レヴィ分布", formula: "Lévy(μ, c)　（位置 μ, 尺度 c）",
+    params: [
+      { key: "mu", label: "μ", min: -2, max: 2, step: 0.5 },
+      { key: "c", label: "c", min: 0.5, max: 3, step: 0.1 },
+    ],
+    pdf: (x, p) => x <= p.mu ? 0 :
+      Math.sqrt(p.c / (2 * Math.PI)) * Math.exp(-p.c / (2 * (x - p.mu))) / (x - p.mu) ** 1.5,
+    range: p => [p.mu - 0.5, p.mu + 10 * p.c],
+  },
+  {
+    name: "べき分布（パレート分布）", formula: "Pareto(xₘ, α)　（x ≥ xₘ）",
+    params: [
+      { key: "xm", label: "xₘ", min: 0.5, max: 3, step: 0.5 },
+      { key: "alpha", label: "α", min: 1, max: 5, step: 0.1 },
+    ],
+    pdf: (x, p) => x < p.xm ? 0 : p.alpha * p.xm ** p.alpha / x ** (p.alpha + 1),
+    range: p => [0, p.xm * 20 ** (1 / p.alpha)],
+  },
+  {
+    name: "ラプラス分布", formula: "Laplace(μ, b)",
+    params: [
+      { key: "mu", label: "μ", min: -5, max: 5, step: 0.5 },
+      { key: "b", label: "b", min: 0.5, max: 3, step: 0.1 },
+    ],
+    pdf: (x, p) => Math.exp(-Math.abs(x - p.mu) / p.b) / (2 * p.b),
+    range: p => [p.mu - 6 * p.b, p.mu + 6 * p.b],
+  },
+  {
+    name: "コーシー分布", formula: "Cauchy(x₀, γ)",
+    params: [
+      { key: "x0", label: "x₀", min: -5, max: 5, step: 0.5 },
+      { key: "gamma", label: "γ", min: 0.5, max: 3, step: 0.1 },
+    ],
+    pdf: (x, p) => 1 / (Math.PI * p.gamma * (1 + ((x - p.x0) / p.gamma) ** 2)),
+    range: p => [p.x0 - 8 * p.gamma, p.x0 + 8 * p.gamma],
+  },
+  {
+    name: "カイ二乗分布", formula: "χ²(k)　（自由度 k）",
+    params: [{ key: "k", label: "k", min: 2, max: 15, step: 1 }],
+    pdf: (x, p) => x <= 0 ? 0 :
+      Math.exp((p.k / 2 - 1) * Math.log(x) - x / 2 - (p.k / 2) * Math.log(2) - lnGamma(p.k / 2)),
+    range: p => [0, p.k + 6 * Math.sqrt(2 * p.k)],
+  },
+  {
+    name: "t分布", formula: "t(ν)　（自由度 ν）",
+    params: [{ key: "nu", label: "ν", min: 1, max: 30, step: 1 }],
+    pdf: (x, p) => Math.exp(lnGamma((p.nu + 1) / 2) - lnGamma(p.nu / 2)
+      - 0.5 * Math.log(p.nu * Math.PI) - ((p.nu + 1) / 2) * Math.log(1 + x * x / p.nu)),
+    range: () => [-6, 6],
+  },
+  {
+    name: "F分布", formula: "F(d₁, d₂)",
+    params: [
+      { key: "d1", label: "d₁", min: 2, max: 20, step: 1 },
+      { key: "d2", label: "d₂", min: 3, max: 30, step: 1 },
+    ],
+    pdf: (x, p) => x <= 0 ? 0 :
+      Math.exp((p.d1 / 2) * Math.log(p.d1 / p.d2) + (p.d1 / 2 - 1) * Math.log(x)
+        - ((p.d1 + p.d2) / 2) * Math.log(1 + p.d1 * x / p.d2) - lnBeta(p.d1 / 2, p.d2 / 2)),
+    range: () => [0, 5],
+  },
+];
+
+// ===== 状態 =====
+let current = null; // { dist, truth, xRange }
+let streak = 0;
+let waiting = false; // 正解表示後、次の問題待ち
+
+const $ = id => document.getElementById(id);
+const decimals = step => (String(step).split(".")[1] || "").length;
+const roundTo = (v, step) => +(Math.round(v / step) * step).toFixed(decimals(step));
+
+function newQuestion() {
+  const dist = DISTS[Math.floor(Math.random() * DISTS.length)];
+  const truth = {};
+  for (const p of dist.params) truth[p.key] = roundTo(p.min + Math.random() * (p.max - p.min), p.step);
+  current = { dist, truth, xRange: dist.range(truth) };
+
+  $("distName").textContent = dist.name;
+  $("distFormula").textContent = dist.formula;
+  $("params").innerHTML = dist.params.map(p => `
+    <div class="param">
+      <label for="in_${p.key}">${p.label}</label>
+      <input id="in_${p.key}" type="number" step="any" required>
+      <small>${p.min}〜${p.max}</small>
+    </div>`).join("");
+  waiting = false;
+  $("mark").textContent = ""; $("detail").textContent = "";
+  $("submitBtn").textContent = "回答する"; $("skip").disabled = false;
+  $("params").querySelector("input").focus();
+  draw();
+}
+
+function readGuess() {
+  const g = {};
+  for (const p of current.dist.params) {
+    const v = parseFloat($("in_" + p.key).value);
+    if (!Number.isFinite(v)) return null;
+    g[p.key] = v;
+  }
+  return g;
+}
+
+// 誤差スコア：各パラメータの |予想 - 正解| を出題範囲の幅で割り、平均したもの
+function score(guess) {
+  const ps = current.dist.params;
+  return ps.reduce((s, p) => s + Math.abs(guess[p.key] - current.truth[p.key]) / (p.max - p.min), 0) / ps.length;
+}
+
+const fmtParams = obj => current.dist.params.map(p => `${p.label}=${obj[p.key]}`).join(", ");
+
+function reveal() { // 正解を表示して「次へ」待ちにする
+  waiting = true;
+  for (const p of current.dist.params) $("in_" + p.key).readOnly = true;
+  $("submitBtn").textContent = "次へ (Enter)";
+  $("skip").disabled = true;
+}
+
+function answer(e) {
+  e.preventDefault();
+  if (waiting) { newQuestion(); return; }
+  const guess = readGuess();
+  if (!guess) return;
+  const s = score(guess);
+  if (s <= THRESHOLD) {
+    streak++;
+    $("mark").textContent = "〇";
+    $("detail").innerHTML = `スコア：${(s * 100).toFixed(1)}%<br>正解：${fmtParams(current.truth)}`;
+    $("streak").textContent = `連続正解：${streak}`;
+    waiting = true;
+    setTimeout(() => { if (waiting) newQuestion(); }, 1000);
+  } else {
+    streak = 0;
+    $("mark").textContent = "×";
+    $("detail").innerHTML = `スコア：${(s * 100).toFixed(1)}%<br>正解：${fmtParams(current.truth)}`;
+    $("streak").textContent = `連続正解：${streak}`;
+    draw(guess);
+    reveal();
+  }
+}
+
+function skip() { // 連続正解数は増えない（リセットもしない）
+  $("mark").textContent = "";
+  $("detail").textContent = `正解：${fmtParams(current.truth)}`;
+  reveal();
+  $("submitBtn").focus();
+}
+
+// ===== 描画 =====
+function niceStep(range, target = 6) {
+  const raw = range / target, mag = 10 ** Math.floor(Math.log10(raw)), n = raw / mag;
+  return (n < 1.5 ? 1 : n < 3 ? 2 : n < 7 ? 5 : 10) * mag;
+}
+
+function draw(guess) {
+  const canvas = $("plot"), dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const COLORS = { "--muted": "#888", "--line": "#e5e5e5", "--curve": "#000", "--guess": "#d33" };
+  const col = name => COLORS[name];
+  const { dist, truth, xRange: [x0, x1] } = current;
+
+  const N = 400, xs = Array.from({ length: N + 1 }, (_, i) => x0 + (x1 - x0) * i / N);
+  const ys = xs.map(x => dist.pdf(x, truth));
+  const yMax = Math.max(...ys.filter(Number.isFinite)) * 1.15;
+
+  const m = { l: 56, r: 16, t: 16, b: 40 };
+  const px = x => m.l + (x - x0) / (x1 - x0) * (W - m.l - m.r);
+  const py = y => H - m.b - y / yMax * (H - m.t - m.b);
+
+  // 目盛り
+  ctx.font = "12px system-ui, sans-serif";
+  ctx.fillStyle = col("--muted"); ctx.strokeStyle = col("--line"); ctx.lineWidth = 1;
+  const xs_ = niceStep(x1 - x0);
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let v = Math.ceil(x0 / xs_) * xs_; v <= x1 + 1e-9; v += xs_) {
+    ctx.beginPath(); ctx.moveTo(px(v), m.t); ctx.lineTo(px(v), H - m.b); ctx.stroke();
+    ctx.fillText(+v.toFixed(6), px(v), H - m.b + 6);
+  }
+  const ys_ = niceStep(yMax, 5);
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let v = 0; v <= yMax + 1e-12; v += ys_) {
+    ctx.beginPath(); ctx.moveTo(m.l, py(v)); ctx.lineTo(W - m.r, py(v)); ctx.stroke();
+    ctx.fillText(+v.toFixed(6), m.l - 6, py(v));
+  }
+
+  const plotCurve = (params, color, dashed) => {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(m.l, m.t, W - m.l - m.r, H - m.t - m.b); ctx.clip();
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash(dashed ? [6, 5] : []);
+    ctx.beginPath();
+    xs.forEach((x, i) => {
+      let y = dist.pdf(x, params);
+      if (!Number.isFinite(y)) y = yMax * 10;
+      i ? ctx.lineTo(px(x), py(y)) : ctx.moveTo(px(x), py(y));
+    });
+    ctx.stroke(); ctx.restore();
+  };
+  plotCurve(truth, col("--curve"), false);
+  if (guess) plotCurve(guess, col("--guess"), true);
+}
+
+// ===== 起動 =====
+$("form").addEventListener("submit", answer);
+$("skip").addEventListener("click", skip);
+window.addEventListener("resize", () => current && draw($("mark").textContent === "×" ? readGuess() : undefined));
+newQuestion();
+</script>
+</body>
+</html>
